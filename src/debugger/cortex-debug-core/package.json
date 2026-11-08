@@ -343,8 +343,8 @@
                 },
                 "cortex-debug.enableTelemetry": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "Enable Telemetry for the Cortex-Debug Extension. Reporting will also respect the global telemetry.enableTelemetry setting."
+                    "default": false,
+                    "description": "Enable Telemetry for the Cortex-Debug Extension. Reporting will also respect the global telemetry.enableTelemetry setting. Off by default; no analytics are sent unless you explicitly enable this."
                 },
                 "cortex-debug.registerUseNaturalFormat": {
                     "type": "boolean",

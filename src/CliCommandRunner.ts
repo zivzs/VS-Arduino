@@ -94,6 +94,39 @@ export class CliCommandRunner {
         await this.context.globalState.update(HISTORY_KEY, updated);
     }
 
+    private tokenizeArgs(input: string): string[] {
+        const tokens: string[] = [];
+        let current = '';
+        let inQuote: '"' | "'" | null = null;
+
+        for (let i = 0; i < input.length; i++) {
+            const ch = input[i];
+            if (inQuote) {
+                if (ch === '\\' && i + 1 < input.length) {
+                    current += input[++i];
+                } else if (ch === inQuote) {
+                    inQuote = null;
+                } else {
+                    current += ch;
+                }
+            } else if (ch === '"' || ch === "'") {
+                inQuote = ch;
+            } else if (/\s/.test(ch)) {
+                if (current.length > 0) {
+                    tokens.push(current);
+                    current = '';
+                }
+            } else {
+                current += ch;
+            }
+        }
+
+        if (current.length > 0) {
+            tokens.push(current);
+        }
+        return tokens;
+    }
+
     private async execute(commandLine: string): Promise<void> {
         const config = vscode.workspace.getConfiguration('vs-arduino');
         const cliPath = config.get<string>('arduinoCliPath') || 'arduino-cli';
@@ -105,16 +138,23 @@ export class CliCommandRunner {
             return;
         }
 
-        const configArgs = /--config-file/.test(userArgs) ? [] : await this.cliManager.getConfigFileArg();
-        const configPart = configArgs.length > 0 ? `${configArgs[0]} "${configArgs[1]}" ` : '';
-        const displayCommand = `arduino-cli ${userArgs}`;
+        const userArgTokens = this.tokenizeArgs(userArgs);
+        if (userArgTokens.length === 0) {
+            vscode.window.showErrorMessage('Enter an arduino-cli subcommand, for example "arduino-cli lib list".');
+            return;
+        }
+
+        const configArgs = userArgTokens.includes('--config-file') ? [] : await this.cliManager.getConfigFileArg();
+        const spawnArgs = [...configArgs, ...userArgTokens];
+        const displayCommand = `arduino-cli ${userArgTokens.join(' ')}`;
 
         this.outputChannel.show(true);
         this.outputChannel.appendLine('');
         this.outputChannel.appendLine(`[Command "${displayCommand}"]`);
 
         const env = dataDir ? { ...process.env, ARDUINO_DIRECTORIES_USER: dataDir } : process.env;
-        const child = spawn(`"${cliPath}" ${configPart}${userArgs}`, { shell: true, env });
+        // Pass argv as an array with shell:false so metacharacters cannot inject extra commands.
+        const child = spawn(cliPath, spawnArgs, { shell: false, env });
         this.activeProcess = child;
 
         let pendingPrompt = '';

@@ -5,9 +5,20 @@ import * as path from 'path';
 import * as fsPromises from 'fs/promises';
 import * as fs from 'fs';
 import * as https from 'https';
+import * as crypto from 'crypto';
 import * as os from 'os';
+import { URL } from 'url';
 
 const execAsync = promisify(exec);
+
+/** Hosts allowed for arduino-cli auto-download (version API, archives, checksums, redirects). */
+const ALLOWED_DOWNLOAD_HOSTS = new Set([
+    'github.com',
+    'api.github.com',
+    'objects.githubusercontent.com',
+    'release-assets.githubusercontent.com',
+    'downloads.arduino.cc',
+]);
 
 export type OutdatedItem = {
     id: string;
@@ -175,11 +186,19 @@ export class ArduinoCliManager {
             const archiveName = this.getReleaseFileName(version);
             const archivePath = path.join(extensionFolder, archiveName);
             const downloadUrl = `https://github.com/arduino/arduino-cli/releases/download/v${version}/${archiveName}`;
+            const checksumUrl = `https://github.com/arduino/arduino-cli/releases/download/v${version}/${version}-checksums.txt`;
+            const checksumPath = path.join(extensionFolder, `${version}-checksums.txt`);
 
             this.outputChannel.appendLine(`[Setup] Downloading from: ${downloadUrl}`);
             vscode.window.showInformationMessage(`Downloading arduino-cli v${version}...`);
             await this.downloadFile(downloadUrl, archivePath);
             this.outputChannel.appendLine(`[Setup] Downloaded archive to: ${archivePath}`);
+
+            this.outputChannel.appendLine(`[Setup] Downloading checksums from: ${checksumUrl}`);
+            await this.downloadFile(checksumUrl, checksumPath);
+            await this.verifyArchiveChecksum(archivePath, archiveName, checksumPath);
+            this.outputChannel.appendLine('[Setup] Archive checksum verified.');
+            await fsPromises.unlink(checksumPath).catch(() => {});
 
             this.outputChannel.appendLine('[Setup] Extracting archive...');
             const isWindows = os.platform() === 'win32';
@@ -217,20 +236,66 @@ export class ArduinoCliManager {
         }
     }
 
+    private assertAllowedDownloadUrl(urlString: string): URL {
+        let parsed: URL;
+        try {
+            parsed = new URL(urlString);
+        } catch {
+            throw new Error(`Invalid download URL: ${urlString}`);
+        }
+
+        if (parsed.protocol !== 'https:') {
+            throw new Error(`Refusing non-HTTPS download URL: ${urlString}`);
+        }
+
+        if (!ALLOWED_DOWNLOAD_HOSTS.has(parsed.hostname)) {
+            throw new Error(`Refusing download from untrusted host: ${parsed.hostname}`);
+        }
+
+        if (parsed.hostname === 'github.com' || parsed.hostname === 'api.github.com') {
+            if (!parsed.pathname.includes('/arduino/arduino-cli/')) {
+                throw new Error(`Refusing GitHub URL outside arduino/arduino-cli: ${urlString}`);
+            }
+        }
+
+        if (parsed.hostname === 'downloads.arduino.cc') {
+            if (!parsed.pathname.includes('/arduino-cli/')) {
+                throw new Error(`Refusing downloads.arduino.cc URL outside arduino-cli: ${urlString}`);
+            }
+        }
+
+        return parsed;
+    }
+
     private downloadFile(url: string, dest: string): Promise<void> {
         return new Promise((resolve, reject) => {
+            let parsed: URL;
+            try {
+                parsed = this.assertAllowedDownloadUrl(url);
+            } catch (err) {
+                return reject(err);
+            }
+
             const file = fs.createWriteStream(dest);
             const options = {
                 headers: {
                     'User-Agent': 'vs-arduino-extension'
                 }
             };
-            https.get(url, options, (response) => {
-                if (response.statusCode === 301 || response.statusCode === 302) {
+            https.get(parsed, options, (response) => {
+                if (response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 307 || response.statusCode === 308) {
                     if (response.headers.location) {
                         file.close();
                         fs.unlink(dest, () => {
-                            this.downloadFile(response.headers.location!, dest).then(resolve).catch(reject);
+                            let nextUrl = response.headers.location!;
+                            try {
+                                // Resolve relative redirect targets against the current URL.
+                                nextUrl = new URL(nextUrl, parsed).toString();
+                                this.assertAllowedDownloadUrl(nextUrl);
+                            } catch (err) {
+                                return reject(err);
+                            }
+                            this.downloadFile(nextUrl, dest).then(resolve).catch(reject);
                         });
                         return;
                     } else {
@@ -254,6 +319,48 @@ export class ArduinoCliManager {
                 fsPromises.unlink(dest).catch(() => {});
                 reject(err);
             });
+        });
+    }
+
+    private async verifyArchiveChecksum(archivePath: string, archiveName: string, checksumPath: string): Promise<void> {
+        const checksumText = await fsPromises.readFile(checksumPath, 'utf8');
+        const expected = this.parseChecksumForFile(checksumText, archiveName);
+        if (!expected) {
+            throw new Error(`No SHA-256 checksum found for ${archiveName} in published checksums file`);
+        }
+
+        const actual = await this.sha256File(archivePath);
+        if (actual.toLowerCase() !== expected.toLowerCase()) {
+            await fsPromises.unlink(archivePath).catch(() => {});
+            throw new Error(`Checksum mismatch for ${archiveName}: expected ${expected}, got ${actual}`);
+        }
+    }
+
+    private parseChecksumForFile(checksumText: string, archiveName: string): string | undefined {
+        for (const rawLine of checksumText.split(/\r?\n/)) {
+            const line = rawLine.trim();
+            if (!line || line.startsWith('#')) {
+                continue;
+            }
+            // Formats: "<sha256>  <filename>" or "<sha256> *<filename>"
+            const match = line.match(/^([A-Fa-f0-9]{64})\s+\*?(\S+)\s*$/);
+            if (!match) {
+                continue;
+            }
+            if (path.basename(match[2]) === archiveName) {
+                return match[1];
+            }
+        }
+        return undefined;
+    }
+
+    private sha256File(filePath: string): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const hash = crypto.createHash('sha256');
+            const stream = fs.createReadStream(filePath);
+            stream.on('data', chunk => hash.update(chunk));
+            stream.on('error', reject);
+            stream.on('end', () => resolve(hash.digest('hex')));
         });
     }
 
