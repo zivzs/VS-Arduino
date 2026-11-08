@@ -11,14 +11,19 @@ import { URL } from 'url';
 
 const execAsync = promisify(exec);
 
-/** Hosts allowed for arduino-cli auto-download (version API, archives, checksums, redirects). */
-const ALLOWED_DOWNLOAD_HOSTS = new Set([
-    'github.com',
-    'api.github.com',
-    'objects.githubusercontent.com',
-    'release-assets.githubusercontent.com',
-    'downloads.arduino.cc',
-]);
+/**
+ * Exact URL patterns allowed for arduino-cli auto-download (no whole-domain allow).
+ * GitHub release asset redirects may land on release-assets/objects.githubusercontent.com.
+ */
+const ALLOWED_DOWNLOAD_URL_PATTERNS: RegExp[] = [
+    // Version / release metadata
+    /^https:\/\/api\.github\.com\/repos\/arduino\/arduino-cli\/releases(?:\/|$)/i,
+    // Release asset pages (archives + checksums)
+    /^https:\/\/github\.com\/arduino\/arduino-cli\/releases\/download\/[^/]+\/[^/]+$/i,
+    // GitHub release CDN redirect targets for those assets only
+    /^https:\/\/release-assets\.githubusercontent\.com\/github-production-release-asset\//i,
+    /^https:\/\/objects\.githubusercontent\.com\/github-production-release-asset\//i,
+];
 
 export type OutdatedItem = {
     id: string;
@@ -248,20 +253,11 @@ export class ArduinoCliManager {
             throw new Error(`Refusing non-HTTPS download URL: ${urlString}`);
         }
 
-        if (!ALLOWED_DOWNLOAD_HOSTS.has(parsed.hostname)) {
-            throw new Error(`Refusing download from untrusted host: ${parsed.hostname}`);
-        }
-
-        if (parsed.hostname === 'github.com' || parsed.hostname === 'api.github.com') {
-            if (!parsed.pathname.includes('/arduino/arduino-cli/')) {
-                throw new Error(`Refusing GitHub URL outside arduino/arduino-cli: ${urlString}`);
-            }
-        }
-
-        if (parsed.hostname === 'downloads.arduino.cc') {
-            if (!parsed.pathname.includes('/arduino-cli/')) {
-                throw new Error(`Refusing downloads.arduino.cc URL outside arduino-cli: ${urlString}`);
-            }
+        // Match against the origin+pathname only (ignore query/hash used by CDN redirects).
+        const canonical = `${parsed.origin}${parsed.pathname}`;
+        const allowed = ALLOWED_DOWNLOAD_URL_PATTERNS.some(pattern => pattern.test(canonical));
+        if (!allowed) {
+            throw new Error(`Refusing download URL outside arduino-cli release asset patterns: ${urlString}`);
         }
 
         return parsed;
